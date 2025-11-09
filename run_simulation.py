@@ -1,311 +1,229 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Apr 13 16:00:56 2023
+Run a *pure simulation* of the photonic polarization classifier.
 
-@author: QNanoLab1
+- Generates synthetic clusters of (psi, chi) points on the Poincaré sphere.
+- Converts them to Jones vectors.
+- Applies a stack of virtual waveplates (quarter/half) parameterized by `params`.
+- Uses a finite-difference gradient step to reduce a custom cost (see cost.py).
+- Plots the optimization trajectories over a background cost map image.
+
+Notes:
+- This file **does not** talk to hardware. For the real experiment, use
+  `run_experiment.py`.
 """
-import numpy as np
-import matplotlib.pyplot as plt
 
 import os
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+
 from cost import cost_function
-from Labels_sphere import state_labels
+from labels_sphere import state_labels  # renamed from Labels_sphere
+
+# Small aliases used in Jones/Stokes helpers
 from numpy import cos as cos
 from numpy import sin as sin
 from numpy import pi as pi
-import matplotlib.image as mpimg
 
+
+# ---------------------------- Conversions ------------------------------------
 def Stokes2Jones(psi, chi):
+    """
+    Convert Stokes angles (psi, chi) to a 2D Jones state [c1, c2].
 
-    stokes_vector = [1, cos(2*psi)*cos(2*chi), sin(2*psi)*cos(2*chi),  sin(2*chi)]
-    
-    # print(stokes_vector)
-    
-    Q=stokes_vector[1];
-    U=stokes_vector[2];
-    V=stokes_vector[3];
-    
+    psi: azimuth (rad), chi: ellipticity (rad)
+    Returns a length-2 complex vector normalized to 1.
+    """
+    # Stokes on the Poincaré sphere
+    Q = cos(2 * psi) * cos(2 * chi)
+    U = sin(2 * psi) * cos(2 * chi)
+    V = sin(2 * chi)
 
-    x = 2*Q
-    y = 2*U
-    z = 2*V
-    
-    norm = np.sqrt(x**2 + y**2 + z**2)
-    
-    x_norm = x/norm
-    y_norm = y/norm
-    z_norm = z/norm
-    
-    phi = np.arctan2(y_norm, x_norm)
-    theta = np.arccos(z_norm)
-    
-    quantum_state = [cos(theta/2), np.exp(complex(0,1)*phi)*sin(theta/2)]
-    
-    return quantum_state
+    # Map to unit 3-vector (x,y,z)
+    x, y, z = 2 * Q, 2 * U, 2 * V
+    nrm = np.sqrt(x**2 + y**2 + z**2)
+    x, y, z = x / nrm, y / nrm, z / nrm
 
-# Folder for saving the data
-# fol_name = input("Folder name: ")
-fol_name = 'data'
-if not os.path.exists(fol_name):
-    os.mkdir(fol_name)
+    # Spherical angles on the Bloch/Poincaré sphere
+    phi = np.arctan2(y, x)
+    theta = np.arccos(z)
 
+    # Jones coefficients of the corresponding pure state
+    return np.array([cos(theta / 2), np.exp(1j * phi) * sin(theta / 2)], dtype=complex)
+
+
+# --------------------------- Output directory --------------------------------
+# (Kept simple; simulation data is small)
+FOLDER = "data"
+os.makedirs(FOLDER, exist_ok=True)
+
+
+# ------------------------------ Classifier utils -----------------------------
 def test(quantum_states, labels):
-    fidelities = np.abs(np.matmul(quantum_states, labels.conj().T))**2
-    max_fidelities = np.max(fidelities, axis=2)
-    arg_fidelities = np.argmax(fidelities, axis=2)
+    """
+    Compute |<state|label>|^2, returning (max_fidelities, argmax_indices)
+    along the label axis.
+    """
+    fidelities = np.abs(np.matmul(quantum_states, labels.conj().T)) ** 2
+    return np.max(fidelities, axis=2), np.argmax(fidelities, axis=2)
 
-    return max_fidelities, arg_fidelities
 
-############# DATA FOR THE ALGORITHM ##########################################
-
-#Choose number of labels
+# --------------------------- Simulation settings -----------------------------
 number_labels = 4
 labels = state_labels(number_labels)
- 
-#Choose number of gates
-number_gates = 2  #Initialization gates do not count
 
-#Choose the number of times the whole set of gates is applied
+# Number of *intermediate* gates (virtual rotation layers)
+number_gates = 2
+
+# Gradient loop
 number_iterations = 50
+st = 0.01        # finite-difference step
+lr = 0.006       # learning rate
 
-#Choose the step for calculate the gradient
-st = 0.01
-
-#Choose the value of the learning rate
-lr = 0.006
-
-###############################################################################
-#Initialize data set
+# Synthetic dataset (psi, chi) clusters
 np.random.seed(123)
-# Set up cluster parameters
 number_clusters = 4
 points_per_cluster = 10
 N_points = number_clusters * points_per_cluster
-centers = [(-0.29*np.pi, 0*np.pi), (0*np.pi, 0.12*np.pi), (0.29*np.pi, 0*np.pi), (0*np.pi, -0.12*np.pi)]
+centers = [
+    (-0.29 * np.pi, 0.00 * np.pi),
+    ( 0.00 * np.pi, 0.12 * np.pi),
+    ( 0.29 * np.pi, 0.00 * np.pi),
+    ( 0.00 * np.pi,-0.12 * np.pi),
+]
 width = 0.075
-widths = [(width, width), (width, width), (width, width), (width, width)]
+widths = [(width, width)] * 4
 
-# Initialize arrays for coordinates and layers
 coordinates_cartesian = []
 coordinates_jones = []
 
-# Generate points within clusters
 for i in range(number_clusters):
-    # Generate points within current cluster
-    for j in range(points_per_cluster):
-        # Generate point with Gaussian distribution
-        point = np.random.normal(loc=centers[i], scale=widths[i])
-        coordinates_cartesian.append([point[0], point[1], 0])
-        coordinates_jones.append(Stokes2Jones(point[0],point[1]))
+    for _ in range(points_per_cluster):
+        psi, chi = np.random.normal(loc=centers[i], scale=widths[i])
+        coordinates_cartesian.append([psi, chi, 0])
+        coordinates_jones.append(Stokes2Jones(psi, chi))
 
-################### Algorithm #################################################
+coordinates_cartesian = np.array(coordinates_cartesian)
+coordinates_jones = np.array(coordinates_jones, dtype=complex)
 
-coordinates_cartesian= np.array(coordinates_cartesian)
 
-#write matrixes that will represent quarter and half
-quarter = lambda th: np.array([[cos(th)**2+complex(0,1)*sin(th)**2, (1-complex(0,1))*sin(th)*cos(th)], [(1-complex(0,1))*sin(th)*cos(th),sin(th)**2+complex(0,1)*cos(th)**2]])
-half = lambda th: np.array([[cos(th)**2-sin(th)**2, 2*sin(th)*cos(th)], [2*sin(th)*cos(th),sin(th)**2-cos(th)**2]])
+# ------------------------- Virtual waveplate models --------------------------
+# Jones matrices in the H/V basis with fast-axis angle th (radians).
+# These match the original script definitions.
+quarter = lambda th: np.array(
+    [
+        [cos(th) ** 2 + 1j * sin(th) ** 2, (1 - 1j) * sin(th) * cos(th)],
+        [(1 - 1j) * sin(th) * cos(th), sin(th) ** 2 + 1j * cos(th) ** 2],
+    ],
+    dtype=complex,
+)
 
-# Cargar la imagen
-imagen = mpimg.imread('cost_4_labels.png')
+half = lambda th: np.array(
+    [
+        [cos(th) ** 2 - sin(th) ** 2, 2 * sin(th) * cos(th)],
+        [2 * sin(th) * cos(th), sin(th) ** 2 - cos(th) ** 2],
+    ],
+    dtype=complex,
+)
 
-# Crear una figura y un eje para el gráfico
+
+# ------------------------------ Background map -------------------------------
+# Optional: plot trajectories on top of a precomputed cost map.
+# If the image is missing, we’ll skip the background without failing.
 fig, ax = plt.subplots()
+bg_path = "cost_4_labels.png"
+if os.path.exists(bg_path):
+    bg_img = mpimg.imread(bg_path)
+    ax.imshow(bg_img, extent=[0, 2 * np.pi, 0, 2 * np.pi], aspect="auto")
 
-# Trazar la imagen de fondo
-ax.imshow(imagen, extent=[0, 2*np.pi, 0, 2*np.pi], aspect='auto')
 
-# #Randomly initialize the angles of the gates
-
-colores = ['red', 'blue', 'green', 'orange', 'purple', 'cyan']
-
-N_rec = 10
-
+# ------------------------------ Optimization ---------------------------------
+N_rec = 10                     # number of random restarts
 final_cost_list = []
 final_angles = []
 
-for i_rec in range(N_rec):
-    
-    print('recorrido No. ', i_rec)
+colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan']
 
-    params = np.random.uniform(size=(number_gates))*2*np.pi
-    
-    #Initial state
-    Initial_state =np.array([1,0])
-    
-    quantum_states_list = []
-    quantum_state = []
-    quantum_states = []
-    
-    # layer_values = np.dot(half(params[3]),np.dot(quarter(params[2]),np.dot(half(params[1]),quarter(params[0]))))
-    
-    layer_values = np.eye(2)
-    
-    for i in range(len(params)):
-        if i % 2 == 0:
-            layer_values = np.dot(quarter(params[i]), layer_values)
-        else:
-            layer_values = np.dot(quarter(params[i]), layer_values)
-    
-    Initialization_list = coordinates_jones
-    
-    for i in range(len(coordinates_cartesian)):
-        quantum_state = np.dot(layer_values,Initialization_list[i]) 
-        quantum_states.append(quantum_state)
-        
-        
-    quantum_states_list.append(quantum_states)
-        
-    # Save first data
-    
-    cost_value = cost_function(quantum_states,coordinates_cartesian,labels)
-    
-    costf = cost_value
+for i_rec in range(N_rec):
+    print("restart #", i_rec)
+
+    # Random initialization of gate angles
+    params = np.random.uniform(size=(number_gates)) * 2 * np.pi
+
+    # Initial stack (here: all quarter-wave for simplicity, as in the original code)
+    stack = np.eye(2, dtype=complex)
+    for k, th in enumerate(params):
+        # If you want QWP/HWP alternating, replace the second line by: half(th)
+        stack = quarter(th) @ stack
+
+    # Propagate all inputs through the stack
+    quantum_states = [stack @ v for v in coordinates_jones]
+    quantum_states = np.array(quantum_states, dtype=complex).reshape(N_points, 1, 2)
+
+    # Initial cost and containers
+    costf = cost_function(quantum_states, coordinates_cartesian, labels)
     cost_list = []
-    max_fidel, max_arg = test(quantum_states, labels)
-    
-    max_arg_list = []
-    max_arg_list.append(max_arg)
-    
-    #Initialize gradient descent
-    Gd = np.zeros(len(params))
-    
-    # print('End of first step of the algorithm.')
-    
-    angles = []
-    
-    #Start iterative procedure. As many epochs as number_iterations
-    for index in range(number_iterations):
-        
-        # print('*************************************************')
-        
-        #Introduce the parameters of the rotation layers
-        params_initial = params.copy()
+    _, max_arg = test(quantum_states, labels)
+
+    # Finite-difference gradient descent
+    angles_trace = []     # keep params evolution to plot trajectory
+    Gd = np.zeros_like(params)
+
+    for it in range(number_iterations):
         x = params.copy()
-    
-        angles.append(x)
-    
-        #Create artificial gradient descent
+        angles_trace.append(x.copy())
+
+        # Compute gradient by perturbation of each parameter
         for j in range(len(x)):
-    
-            # print(index, 'mini epoch layer number:  ', j)
-    
             x[j] += st
-    
-            layer_values = np.eye(2)
-    
-            for i in range(len(params)):
-                if i % 2 == 0:
-                    layer_values = np.dot(quarter(x[i]), layer_values)
-                else:
-                    layer_values = np.dot(quarter(x[i]), layer_values)
-    
-            # layer_values  = np.dot(half(x[3]),np.dot(quarter(x[2]),np.dot(half(x[1]),quarter(x[0]))))
-    
-            
-            quantum_states = []
-            
-            for i in range(len(coordinates_cartesian)):
-                
-                  quantum_state = np.dot(layer_values,Initialization_list[i])
-                 
-                  quantum_states.append(quantum_state)
-            
-            #we move all the itermediate layers before initializing the points
-    
-            cost_value = cost_function(quantum_states,coordinates_cartesian,labels)
-    
-            # print('cost_value = ', cost_value)
-            Gd[j] = (costf - cost_value)/st
-    
-            # x[j] -= st
-    
-            # if we take into account the change in the cost based on the one before the iterations for the individual entries, we have to change the parameters
-            # individually based all the time on the reference parameters entering the loop, and we cannot update the parameters individually in each iteration. If so,
-            # we should also take that into account to calculate the Gd and include in the formula the cost generated by the entry i when looking at GD of i+1, and not the initial one
-    
-        ch = lr * Gd  # if we consider all the changes at the same time maybe it is better if I make this number smaller
-    
-        # We could either update the value of the entry of x step by step takin into account how much it varies per single step, or we could instead
-        # (as it is done here) modify step by step th whole array of values of x an then compute the gradient based on that. In th end we are
-        # multiplying matrices s this is linear. Maybe considering the whole array we do not get interactions between arrays in the sense that moving one gate affects the rest)
-        # and it might be better (not to lose track of hat changes improve at what moment and what changes make it worse) /more precise to perform
-        # the updating step by step.
-    
-        params += ch
-    
-        # layer_values = np.dot(half(params[3]),np.dot(quarter(params[2]),np.dot(half(params[1]),quarter(params[0]))))
-    
-        layer_values = np.eye(2)
-    
-        for i in range(len(params)):
-            if i % 2 == 0:
-                layer_values = np.dot(quarter(params[i]), layer_values)
-            else:
-                layer_values = np.dot(quarter(params[i]), layer_values)
-    
-        quantum_states =[]
-        
-        for i in range(len(coordinates_cartesian)):
-                
-                  quantum_state = np.dot(layer_values,Initialization_list[i])
-    
-                  quantum_states.append(quantum_state)
-                 
-        max_fidel, max_arg = test(quantum_states, labels)
-        # print('quantum_states = ', quantum_states)
-        # print('labels = ', labels)
-        # print('max_fidel = ', max_fidel)
-        # print('max_arg = ', max_arg)
-    
-        costf = cost_function(quantum_states,coordinates_cartesian,labels)
-    
-        # print('costf = ', costf)
-    
+
+            # Rebuild stack with perturbed angles (still QWPs as in original)
+            stack_x = np.eye(2, dtype=complex)
+            for th in x:
+                stack_x = quarter(th) @ stack_x
+
+            # Propagate and compute cost
+            qs_x = [stack_x @ v for v in coordinates_jones]
+            qs_x = np.array(qs_x, dtype=complex).reshape(N_points, 1, 2)
+
+            cost_x = cost_function(qs_x, coordinates_cartesian, labels)
+            Gd[j] = (costf - cost_x) / st
+
+        # Gradient step
+        params += lr * Gd
+
+        # Rebuild stack with updated params and recompute cost
+        stack = np.eye(2, dtype=complex)
+        for th in params:
+            stack = quarter(th) @ stack
+
+        quantum_states = [stack @ v for v in coordinates_jones]
+        quantum_states = np.array(quantum_states, dtype=complex).reshape(N_points, 1, 2)
+
+        _, max_arg = test(quantum_states, labels)
+        costf = cost_function(quantum_states, coordinates_cartesian, labels)
         cost_list.append(costf)
-        
-        quantum_states_list.append(quantum_states)
-        max_arg_list.append(max_arg)
 
     final_cost_list.append(costf)
     final_angles.append(params)
 
-
-    angles = np.array(angles)
-    angles = angles % (2 * np.pi)
-
-    # Separa las coordenadas x e y en listas separadas para facilitar el trazado
-    x_coords, y_coords = zip(*angles)
-    
-    # Trazar el recorrido
-    ax.plot(x_coords, y_coords, marker='.', linestyle=' ', color='red')
+    # Plot the trajectory on top of the background map
+    angles_trace = np.array(angles_trace) % (2 * np.pi)
+    if angles_trace.shape[1] == 2:
+        x_coords, y_coords = angles_trace[:, 0], angles_trace[:, 1]
+        ax.plot(x_coords, y_coords, marker='.', linestyle=' ', color=colors[i_rec % len(colors)])
 
 
+# ------------------------------ Final plot -----------------------------------
 final_angles_cost = np.hstack((final_angles, np.array(final_cost_list).reshape(-1, 1)))
 
-# Configurar etiquetas y títulos
 ax.set_xlabel('Half angle')
 ax.set_ylabel('Quarter angle')
-ax.set_title('Cost function')
+ax.set_title('Cost function (trajectories)')
 ax.grid(True)
-
-# Mostrar el gráfico
 plt.show()
 
-
-
-# ruta_archivo = os.path.join(fol_name, "quantum_states.npy")
-# quantum_states_list = np.array(quantum_states_list)
-# np.save(ruta_archivo, quantum_states_list)
-
-# ruta_archivo = os.path.join(fol_name, "max_arg.npy")
-# max_arg_list = np.array(max_arg_list)
-# np.save(ruta_archivo, max_arg_list)
-
-# ruta_archivo = os.path.join(fol_name, "coordinates_theoretical.npy")
-# coordinates_cartesian = np.array(coordinates_cartesian)
-# np.save(ruta_archivo, coordinates_cartesian)
-
-# ruta_archivo = os.path.join(fol_name, "labels.npy")
-# labels = np.array(labels)
-# np.save(ruta_archivo, labels)
+# If you want to persist arrays, uncomment as needed:
+# np.save(os.path.join(FOLDER, "coordinates_cartesian.npy"), coordinates_cartesian)
+# np.save(os.path.join(FOLDER, "final_angles_cost.npy"), final_angles_cost)

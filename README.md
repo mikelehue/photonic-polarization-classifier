@@ -95,20 +95,3 @@ Both the **simulation** and **experiment** reproduce the results presented in th
 Experimental and numerical results show excellent agreement with minimal drift or noise dependence.  
 
 ---
-
-## 🧾 Reference
-
-If you use this code or build upon it, please cite:
-
-@article{Varga2024QuantumClustering,  
-  title   = {Quantum-inspired clustering with light},  
-  author  = {Varga, Miguel and Bermejo, Pablo and Pellicer-Guridi, Ruben and Orús, Román and Molina-Terriza, Gabriel},  
-  journal = {Scientific Reports},  
-  year    = {2024},  
-  volume  = {14},  
-  pages   = {21726},  
-  doi     = {10.1038/s41598-024-73053-z}  
-}  
- ---
-
- the full paper (PDF)](docs/QuantumInspiredClustering_Varga2024.pdf)  
